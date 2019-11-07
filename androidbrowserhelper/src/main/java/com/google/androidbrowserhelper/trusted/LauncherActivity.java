@@ -144,7 +144,7 @@ public class LauncherActivity extends AppCompatActivity {
 
 
         mTwaLauncher = new TwaLauncher(this);
-        mTwaLauncher.launch(twaBuilder, mSplashScreenStrategy, () -> mBrowserWasLaunched = true);
+        mTwaLauncher.launch(twaBuilder, mSplashScreenStrategy, mMetadata.initialWebBundle, mMetadata.fileProviderAuthority, () -> mBrowserWasLaunched = true);
 
         if (!sChromeVersionChecked) {
             ChromeUpdatePrompt.promptIfNeeded(this, mTwaLauncher.getProviderPackage());

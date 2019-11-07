@@ -16,6 +16,8 @@ package com.google.androidbrowserhelper.trusted;
 
 import android.content.ComponentName;
 import android.content.Context;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.content.Intent;
 import android.net.Uri;
 import android.util.Log;
@@ -58,6 +60,12 @@ public class TwaLauncher {
     private CustomTabsSession mSession;
 
     private boolean mDestroyed;
+
+    private boolean mTransferingWebBundles = false;
+    private boolean mWaitingForSplashScreen = false;
+    private String mInitialWebBundleUri;
+
+    private WebBundlesTransferTask mWebBundlesTransferTask;
 
     /**
      * Creates an instance that will automatically choose the browser to launch a TWA in.
@@ -102,7 +110,7 @@ public class TwaLauncher {
      * @param url Url to open.
      */
     public void launch(Uri url) {
-        launch(new TrustedWebActivityIntentBuilder(url), null, null);
+        launch(new TrustedWebActivityIntentBuilder(url), null, null, null, null);
     }
 
     /**
@@ -117,12 +125,29 @@ public class TwaLauncher {
     public void launch(TrustedWebActivityIntentBuilder twaBuilder,
             @Nullable SplashScreenStrategy splashScreenStrategy,
             @Nullable Runnable completionCallback) {
+        launch(twaBuilder, splashScreenStrategy, null, null, completionCallback);
+    }
+
+    /**
+     * Similar to {@link #launch(Uri)}, but allows more customization.
+     *
+     * @param twaBuilder {@link TrustedWebActivityIntentBuilder} containing the url to open, along with
+     * optional parameters: status bar color, additional trusted origins, etc.
+     * @param splashScreenStrategy {@link SplashScreenStrategy} to use for showing splash screens,
+     * null if splash screen not needed.
+     * @param completionCallback Callback triggered when the url has been opened.
+     */
+    public void launch(TrustedWebActivityIntentBuilder twaBuilder,
+            @Nullable SplashScreenStrategy splashScreenStrategy,
+            @Nullable String initialWebBundle,
+            @Nullable String fileProviderAuthority,
+            @Nullable Runnable completionCallback) {
         if (mDestroyed) {
             throw new IllegalStateException("TwaLauncher already destroyed");
         }
 
         if (mLaunchMode == TwaProviderPicker.LaunchMode.TRUSTED_WEB_ACTIVITY) {
-            launchTwa(twaBuilder, splashScreenStrategy, completionCallback);
+            launchTwa(twaBuilder, splashScreenStrategy, initialWebBundle, fileProviderAuthority, completionCallback);
         } else {
             launchCct(twaBuilder, completionCallback);
         }
@@ -144,13 +169,15 @@ public class TwaLauncher {
 
     private void launchTwa(TrustedWebActivityIntentBuilder twaBuilder,
             @Nullable SplashScreenStrategy splashScreenStrategy,
+            @Nullable String initialWebBundle,
+            @Nullable String fileProviderAuthority,
             @Nullable Runnable completionCallback) {
         if (splashScreenStrategy != null) {
             splashScreenStrategy.onTwaLaunchInitiated(mProviderPackage, twaBuilder);
         }
 
         Runnable onSessionCreatedRunnable = () ->
-                launchWhenSessionEstablished(twaBuilder, splashScreenStrategy, completionCallback);
+                launchWhenSessionEstablished(twaBuilder, splashScreenStrategy, initialWebBundle, fileProviderAuthority, completionCallback);
 
         if (mSession != null) {
             onSessionCreatedRunnable.run();
@@ -177,12 +204,27 @@ public class TwaLauncher {
 
     private void launchWhenSessionEstablished(TrustedWebActivityIntentBuilder twaBuilder,
             @Nullable SplashScreenStrategy splashScreenStrategy,
+            @Nullable String initialWebBundle,
+            @Nullable String fileProviderAuthority,
             @Nullable Runnable completionCallback) {
         if (mSession == null) {
             throw new IllegalStateException("mSession is null in launchWhenSessionEstablished");
         }
 
+        boolean webBundlesSupported = webBundlesAreSupported(mContext,
+                mProviderPackage, "androidx.browser.trusted.category.TrustedWebActivityWebBundlesV1");
+
+        if (initialWebBundle != null && webBundlesSupported && fileProviderAuthority != null) {
+            mTransferingWebBundles = true;
+            mWebBundlesTransferTask = new WebBundlesTransferTask(mContext,
+                    initialWebBundle, fileProviderAuthority, mSession,
+                    mProviderPackage);
+            mWebBundlesTransferTask.execute(
+                    initialWebBundleUri -> initialWebBundlesTransfered(initialWebBundleUri, twaBuilder, completionCallback));
+        }
+
         if (splashScreenStrategy != null) {
+            mWaitingForSplashScreen = true;
             splashScreenStrategy.configureTwaBuilder(twaBuilder, mSession,
                     () -> launchWhenSplashScreenReady(twaBuilder, completionCallback));
         } else {
@@ -190,10 +232,47 @@ public class TwaLauncher {
         }
     }
 
+    private void initialWebBundlesTransfered(Uri initialWebBundleUri,
+                                             TrustedWebActivityIntentBuilder builder,
+                                             @Nullable Runnable completionCallback) {
+        if (initialWebBundleUri != null) {
+            mInitialWebBundleUri = initialWebBundleUri.toString();
+        }
+        mWebBundlesTransferTask = null;
+        mTransferingWebBundles = false;
+        if (!mTransferingWebBundles && !mWaitingForSplashScreen) {
+            launchImpl(builder, completionCallback);
+        }
+    }
+
+    private static boolean webBundlesAreSupported(Context context, String packageName,
+                                                  String version) {
+        Intent serviceIntent = new Intent()
+                .setAction(CustomTabsService.ACTION_CUSTOM_TABS_CONNECTION)
+                .setPackage(packageName);
+        ResolveInfo resolveInfo =
+                context.getPackageManager().resolveService(serviceIntent,
+                        PackageManager.GET_RESOLVED_FILTER);
+        if (resolveInfo == null || resolveInfo.filter == null) return false;
+        return resolveInfo.filter.hasCategory(version);
+    }
+
+
     private void launchWhenSplashScreenReady(TrustedWebActivityIntentBuilder builder,
             @Nullable Runnable completionCallback) {
+        mWaitingForSplashScreen = false;
+        if (!mTransferingWebBundles && !mWaitingForSplashScreen) {
+            launchImpl(builder, completionCallback);
+        }
+    }
+
+    private void launchImpl(TrustedWebActivityIntentBuilder builder,
+                            @Nullable Runnable completionCallback) {
         Log.d(TAG, "Launching Trusted Web Activity.");
         Intent intent = builder.build(mSession);
+        if (mInitialWebBundleUri != null) {
+            intent.putExtra("android.support.customtabs.extra.INITIAL_WEB_BUNDLE", mInitialWebBundleUri);
+        }
         ContextCompat.startActivity(mContext, intent, null);
         // Remember who we connect to as the package that is allowed to delegate notifications
         // to us.
@@ -207,6 +286,9 @@ public class TwaLauncher {
      * Performs clean-up.
      */
     public void destroy() {
+        if (mWebBundlesTransferTask != null) {
+            mWebBundlesTransferTask.cancel();
+        }
         if (mServiceConnection != null) {
             mContext.unbindService(mServiceConnection);
         }
